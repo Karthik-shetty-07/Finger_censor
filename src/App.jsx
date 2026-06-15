@@ -27,6 +27,10 @@ function App() {
   const [showLandmarks, setShowLandmarks] = useState(false);
   const [hysteresisCount, setHysteresisCount] = useState(8);
   const [mirrorMode, setMirrorMode] = useState(true);
+  const [facingMode, setFacingMode] = useState("user"); // "user" | "environment"
+  const [performanceMode, setPerformanceMode] = useState(() => 
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ? "balanced" : "high"
+  );
 
   // --- Refs ---
   const videoRef = useRef(null);
@@ -38,13 +42,33 @@ function App() {
   const latestInferenceRef = useRef(0);
   const hysteresisRef = useRef(0);
   const lastBoxRef = useRef(null);
-  const settingsRef = useRef({ mode: censorMode, emoji: selectedEmoji, enabled: censorEnabled, showLandmarks, hysteresisCount, mirrorMode });
+  const lastDetectTimeRef = useRef(0);
+  const blurCanvasRef = useRef(null);
+  const settingsRef = useRef({ 
+    mode: censorMode, 
+    emoji: selectedEmoji, 
+    enabled: censorEnabled, 
+    showLandmarks, 
+    hysteresisCount, 
+    mirrorMode,
+    facingMode,
+    performanceMode
+  });
   const streamRef = useRef(null);
 
   // Keep settings ref in sync (avoids stale closures in animation loop)
   useEffect(() => {
-    settingsRef.current = { mode: censorMode, emoji: selectedEmoji, enabled: censorEnabled, showLandmarks, hysteresisCount, mirrorMode };
-  }, [censorMode, selectedEmoji, censorEnabled, showLandmarks, hysteresisCount, mirrorMode]);
+    settingsRef.current = { 
+      mode: censorMode, 
+      emoji: selectedEmoji, 
+      enabled: censorEnabled, 
+      showLandmarks, 
+      hysteresisCount, 
+      mirrorMode,
+      facingMode,
+      performanceMode
+    };
+  }, [censorMode, selectedEmoji, censorEnabled, showLandmarks, hysteresisCount, mirrorMode, facingMode, performanceMode]);
 
   // Keyboard shortcut: "S" to toggle settings
   useEffect(() => {
@@ -59,15 +83,26 @@ function App() {
   }, []);
 
   // --- Camera Access ---
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (facing = facingMode) => {
     setCameraState("loading");
     setCameraError("");
+    if (streamRef.current) {
+      try {
+        streamRef.current.getTracks().forEach(t => t.stop());
+      } catch (e) {
+        console.error("Error stopping tracks:", e);
+      }
+    }
     try {
+      const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+      const widthConstraint = isMobile ? { ideal: 960 } : { ideal: 1280 };
+      const heightConstraint = isMobile ? { ideal: 540 } : { ideal: 720 };
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: "user",
+          width: widthConstraint,
+          height: heightConstraint,
+          facingMode: facing,
           frameRate: { ideal: 30 }
         },
         audio: false,
@@ -87,13 +122,21 @@ function App() {
       );
       setCameraState("error");
     }
-  }, []);
+  }, [facingMode]);
+
+  const handleCameraSwitch = async (newFacing) => {
+    setFacingMode(newFacing);
+    setMirrorMode(newFacing === "user");
+    await startCamera(newFacing);
+  };
 
   // Cleanup camera on unmount
   useEffect(() => {
     return () => {
       if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
+        try {
+          streamRef.current.getTracks().forEach(t => t.stop());
+        } catch (_) {}
       }
     };
   }, []);
@@ -158,7 +201,7 @@ function App() {
     let running = true;
     let lastCensoredState = false;
 
-    const processFrame = async () => {
+    const processFrame = () => {
       if (!running) return;
 
       if (video.paused || video.ended || video.readyState < 2) {
@@ -190,17 +233,61 @@ function App() {
       ctx.drawImage(video, 0, 0, w, h);
       ctx.restore();
 
-      // Send frame to worker for detection
+      // Send frame to worker for detection (non-blocking, downscaled, and rate-limited)
+      const now = performance.now();
       if (workerRef.current && !workerBusyRef.current && modelLoaded) {
-        try {
+        const lastDetect = lastDetectTimeRef.current || 0;
+        const elapsed = now - lastDetect;
+        
+        let targetInterval = 0; // high performance
+        if (settings.performanceMode === "balanced") {
+          targetInterval = 45; // ~22 FPS
+        } else if (settings.performanceMode === "battery") {
+          targetInterval = 83; // ~12 FPS
+        }
+
+        if (elapsed >= targetInterval) {
           workerBusyRef.current = true;
-          const bitmap = await createImageBitmap(video);
-          workerRef.current.postMessage(
-            { type: "detect", data: { imageBitmap: bitmap, timestamp: performance.now() } },
-            [bitmap]
-          );
-        } catch {
-          workerBusyRef.current = false;
+          lastDetectTimeRef.current = now;
+
+          // Downscale detection resolution to 320px width to reduce latency
+          const targetWidth = 320;
+          const targetHeight = Math.round((video.videoHeight / video.videoWidth) * targetWidth);
+
+          createImageBitmap(video, {
+            resizeWidth: targetWidth,
+            resizeHeight: targetHeight,
+            resizeQuality: "low"
+          })
+            .then((bitmap) => {
+              if (workerRef.current) {
+                workerRef.current.postMessage(
+                  { type: "detect", data: { imageBitmap: bitmap, timestamp: performance.now() } },
+                  [bitmap]
+                );
+              } else {
+                bitmap.close();
+                workerBusyRef.current = false;
+              }
+            })
+            .catch((err) => {
+              // Fallback to full resolution if downscaling options are not supported
+              createImageBitmap(video)
+                .then((bitmap) => {
+                  if (workerRef.current) {
+                    workerRef.current.postMessage(
+                      { type: "detect", data: { imageBitmap: bitmap, timestamp: performance.now() } },
+                      [bitmap]
+                    );
+                  } else {
+                    bitmap.close();
+                    workerBusyRef.current = false;
+                  }
+                })
+                .catch(() => {
+                  workerBusyRef.current = false;
+                });
+            });
         }
       }
 
@@ -250,25 +337,51 @@ function App() {
         const { x, y, radius } = handBox;
 
         if (settings.mode.endsWith("blur")) {
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(x, y, radius, 0, Math.PI * 2);
-          ctx.clip();
+          // Hardware-accelerated bilinear blur simulation:
+          // Downscale the clipped region and draw it back scaled up!
+          const srcX = Math.max(0, x - radius);
+          const srcY = Math.max(0, y - radius);
+          const srcW = Math.min(w - srcX, radius * 2);
+          const srcH = Math.min(h - srcY, radius * 2);
 
-          let blurPx = "24px";
-          if (settings.mode === "light-blur") blurPx = "14px";
-          if (settings.mode === "heavy-blur") blurPx = "48px";
+          if (srcW > 0 && srcH > 0) {
+            if (!blurCanvasRef.current) {
+              blurCanvasRef.current = document.createElement("canvas");
+            }
+            const blurCanvas = blurCanvasRef.current;
+            const blurCtx = blurCanvas.getContext("2d");
 
-          ctx.filter = `blur(${blurPx})`;
-          // Re-draw video into clipped region for blur
-          ctx.save();
-          if (settings.mirrorMode) {
-            ctx.translate(w, 0);
-            ctx.scale(-1, 1);
+            // Smaller offscreen size = heavier blur
+            let tinySize = 16;
+            if (settings.mode === "light-blur") tinySize = 32;
+            if (settings.mode === "heavy-blur") tinySize = 8;
+
+            blurCanvas.width = tinySize;
+            blurCanvas.height = tinySize;
+
+            ctx.save();
+            // Clip to hand circle
+            ctx.beginPath();
+            ctx.arc(x, y, radius, 0, Math.PI * 2);
+            ctx.clip();
+
+            // Clear and copy current canvas hand region to tiny canvas
+            blurCtx.clearRect(0, 0, tinySize, tinySize);
+            blurCtx.drawImage(
+              canvas,
+              srcX, srcY, srcW, srcH,
+              0, 0, tinySize, tinySize
+            );
+
+            // Draw it back stretched
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "medium";
+            ctx.drawImage(
+              blurCanvas,
+              x - radius, y - radius, radius * 2, radius * 2
+            );
+            ctx.restore();
           }
-          ctx.drawImage(video, 0, 0, w, h);
-          ctx.restore();
-          ctx.restore();
 
           // Neon ring around blur
           ctx.save();
@@ -329,12 +442,12 @@ function App() {
       }
 
       frameCount++;
-      const now = performance.now();
-      if (now - lastFpsTime >= 1000) {
-        setFps(Math.round((frameCount * 1000) / (now - lastFpsTime)));
+      const currentFpsTime = performance.now();
+      if (currentFpsTime - lastFpsTime >= 1000) {
+        setFps(Math.round((frameCount * 1000) / (currentFpsTime - lastFpsTime)));
         setInferenceMs(Math.round(latestInferenceRef.current * 10) / 10);
         frameCount = 0;
-        lastFpsTime = now;
+        lastFpsTime = currentFpsTime;
       }
 
       animRef.current = requestAnimationFrame(processFrame);
@@ -570,6 +683,55 @@ function App() {
                   </div>
                   <div className={`toggle-switch ${mirrorMode ? "on" : ""}`}>
                     <div className="toggle-knob" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Camera Source */}
+              <div className="setting-section" id="section-camera">
+                <span className="setting-label">Camera Source</span>
+                <div className="mode-grid dynamic-2-col">
+                  <div
+                    className={`mode-card ${facingMode === "user" ? "active" : ""}`}
+                    onClick={() => handleCameraSwitch("user")}
+                  >
+                    <div className="mode-icon">🤳</div>
+                    <span className="mode-name">Front (Selfie)</span>
+                  </div>
+                  <div
+                    className={`mode-card ${facingMode === "environment" ? "active" : ""}`}
+                    onClick={() => handleCameraSwitch("environment")}
+                  >
+                    <div className="mode-icon">📷</div>
+                    <span className="mode-name">Back (Camera)</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Performance Mode */}
+              <div className="setting-section" id="section-performance">
+                <span className="setting-label">Performance Profile</span>
+                <div className="mode-grid">
+                  <div
+                    className={`mode-card ${performanceMode === "high" ? "active" : ""}`}
+                    onClick={() => setPerformanceMode("high")}
+                  >
+                    <div className="mode-icon">⚡</div>
+                    <span className="mode-name">High (Max)</span>
+                  </div>
+                  <div
+                    className={`mode-card ${performanceMode === "balanced" ? "active" : ""}`}
+                    onClick={() => setPerformanceMode("balanced")}
+                  >
+                    <div className="mode-icon">⚖️</div>
+                    <span className="mode-name">Balanced</span>
+                  </div>
+                  <div
+                    className={`mode-card ${performanceMode === "battery" ? "active" : ""}`}
+                    onClick={() => setPerformanceMode("battery")}
+                  >
+                    <div className="mode-icon">🔋</div>
+                    <span className="mode-name">Battery Saver</span>
                   </div>
                 </div>
               </div>

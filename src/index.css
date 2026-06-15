@@ -734,3 +734,57 @@ input[type="range"]::-webkit-slider-thumb:hover {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ========== MOBILE OPTIMIZATIONS & HELPER CLASSES ========== */
+
+.dynamic-2-col {
+  grid-template-columns: repeat(2, 1fr) !important;
+}
+
+@media (max-width: 768px) {
+  .settings-panel {
+    padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    max-height: 75vh;
+  }
+  
+  .settings-content {
+    gap: 20px;
+    padding: 4px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+  
+  .settings-toggle-btn {
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    padding: 12px 24px;
+    font-size: 14px;
+  }
+  
+  .hud-bar {
+    padding: 12px 16px;
+  }
+  
+  .hud-brand {
+    font-size: 14px;
+  }
+  
+  .hud-stats {
+    gap: 12px;
+  }
+  
+  .toggle-row {
+    padding: 14px 18px;
+  }
+  
+  .mode-card {
+    padding: 16px 10px;
+  }
+  
+  .emoji-chip {
+    width: 44px;
+    height: 44px;
+    font-size: 22px;
+  }
+  
+  .settings-kbd {
+    display: none;
+  }
+}
