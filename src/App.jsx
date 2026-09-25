@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { getHandBoundingBox } from "./utils/detector";
 
 // SVG Icons as inline components (no dependency on lucide-react)
@@ -8,6 +8,16 @@ const GearIcon = ({ className }) => (
     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
   </svg>
 );
+
+const EMOJI_OPTIONS = ["🤬", "🖕", "😡", "🚫", "💀", "🤡", "🙈", "⛔", "❌", "😤"];
+
+const getCensorModes = (selectedEmoji) => [
+  { id: "light-blur", label: "Light Blur", iconClass: "blur-swatch blur-light" },
+  { id: "medium-blur", label: "Medium Blur", iconClass: "blur-swatch blur-medium" },
+  { id: "heavy-blur", label: "Heavy Blur", iconClass: "blur-swatch blur-heavy" },
+  { id: "emoji", label: "Emoji", icon: selectedEmoji },
+  { id: "black", label: "Blackout", icon: "⬛" },
+];
 
 function App() {
   // --- State ---
@@ -44,6 +54,9 @@ function App() {
   const lastBoxRef = useRef(null);
   const lastDetectTimeRef = useRef(0);
   const blurCanvasRef = useRef(null);
+  const lastUiUpdateRef = useRef(0);
+  const fpsRef = useRef(0);
+  const inferenceMsRef = useRef(0);
   const settingsRef = useRef({ 
     mode: censorMode, 
     emoji: selectedEmoji, 
@@ -201,11 +214,22 @@ function App() {
     let running = true;
     let lastCensoredState = false;
 
+    const scheduleNextFrame = () => {
+      if (!running) return;
+      if (video.requestVideoFrameCallback) {
+        video.requestVideoFrameCallback(() => {
+          if (running) processFrame();
+        });
+      } else {
+        animRef.current = requestAnimationFrame(processFrame);
+      }
+    };
+
     const processFrame = () => {
       if (!running) return;
 
       if (video.paused || video.ended || video.readyState < 2) {
-        animRef.current = requestAnimationFrame(processFrame);
+        scheduleNextFrame();
         return;
       }
 
@@ -238,20 +262,19 @@ function App() {
       if (workerRef.current && !workerBusyRef.current && modelLoaded) {
         const lastDetect = lastDetectTimeRef.current || 0;
         const elapsed = now - lastDetect;
-        
-        let targetInterval = 0; // high performance
+
+        let targetInterval = 30;
         if (settings.performanceMode === "balanced") {
-          targetInterval = 45; // ~22 FPS
+          targetInterval = 50;
         } else if (settings.performanceMode === "battery") {
-          targetInterval = 83; // ~12 FPS
+          targetInterval = 85;
         }
 
         if (elapsed >= targetInterval) {
           workerBusyRef.current = true;
           lastDetectTimeRef.current = now;
 
-          // Downscale detection resolution to 320px width to reduce latency
-          const targetWidth = 320;
+          const targetWidth = settings.performanceMode === "battery" ? 220 : settings.performanceMode === "balanced" ? 260 : 320;
           const targetHeight = Math.round((video.videoHeight / video.videoWidth) * targetWidth);
 
           createImageBitmap(video, {
@@ -443,21 +466,37 @@ function App() {
 
       frameCount++;
       const currentFpsTime = performance.now();
+      const elapsedUiTime = currentFpsTime - lastUiUpdateRef.current;
       if (currentFpsTime - lastFpsTime >= 1000) {
-        setFps(Math.round((frameCount * 1000) / (currentFpsTime - lastFpsTime)));
-        setInferenceMs(Math.round(latestInferenceRef.current * 10) / 10);
+        const nextFps = Math.round((frameCount * 1000) / (currentFpsTime - lastFpsTime));
+        const nextInferenceMs = Math.round(latestInferenceRef.current * 10) / 10;
+        const prevFps = fpsRef.current;
+        const prevInferenceMs = inferenceMsRef.current;
+
+        fpsRef.current = nextFps;
+        inferenceMsRef.current = nextInferenceMs;
+
+        if (elapsedUiTime >= 150 || nextFps !== prevFps || nextInferenceMs !== prevInferenceMs) {
+          setFps(nextFps);
+          setInferenceMs(nextInferenceMs);
+          lastUiUpdateRef.current = currentFpsTime;
+        }
+
         frameCount = 0;
         lastFpsTime = currentFpsTime;
       }
 
-      animRef.current = requestAnimationFrame(processFrame);
+      scheduleNextFrame();
     };
 
-    animRef.current = requestAnimationFrame(processFrame);
+    scheduleNextFrame();
 
     return () => {
       running = false;
-      if (animRef.current) cancelAnimationFrame(animRef.current);
+      if (animRef.current) {
+        cancelAnimationFrame(animRef.current);
+        animRef.current = null;
+      }
     };
   }, [cameraState, modelLoaded]);
 
@@ -465,15 +504,8 @@ function App() {
   const fpsColor = fps >= 24 ? "good" : fps >= 15 ? "warn" : "bad";
   const msColor = inferenceMs < 50 ? "good" : inferenceMs < 100 ? "warn" : "bad";
 
-  const emojiOptions = ["🤬", "🖕", "😡", "🚫", "💀", "🤡", "🙈", "⛔", "❌", "😤"];
-
-  const censorModes = [
-    { id: "light-blur", label: "Light Blur", iconClass: "blur-swatch blur-light" },
-    { id: "medium-blur", label: "Medium Blur", iconClass: "blur-swatch blur-medium" },
-    { id: "heavy-blur", label: "Heavy Blur", iconClass: "blur-swatch blur-heavy" },
-    { id: "emoji", label: "Emoji", icon: selectedEmoji },
-    { id: "black", label: "Blackout", icon: "⬛" },
-  ];
+  const emojiOptions = EMOJI_OPTIONS;
+  const censorModes = useMemo(() => getCensorModes(selectedEmoji), [selectedEmoji]);
 
   return (
     <div className="app-container" id="app-root">
